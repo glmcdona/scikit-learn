@@ -5,6 +5,7 @@
 #          Robert Layton <robertlayton@gmail.com>
 #          Jochen Wersdörfer <jochen@wersdoerfer.de>
 #          Roman Sinayev <roman.sinayev@gmail.com>
+#          Geoff McDonald <glmcdona@gmail.com>
 #
 # License: BSD 3 clause
 """
@@ -27,11 +28,11 @@ import scipy.sparse as sp
 
 from ..base import BaseEstimator, TransformerMixin, _OneToOneFeatureMixin
 from ..preprocessing import normalize
-from ._hash import FeatureHasher
+from ._hash import FeatureHasher, _iteritems
 from ._stop_words import ENGLISH_STOP_WORDS
 from ..utils.validation import check_is_fitted, check_array, FLOAT_DTYPES, check_scalar
 from ..utils.deprecation import deprecated
-from ..utils import _IS_32BIT
+from ..utils import _IS_32BIT, IS_PYPY
 from ..utils.fixes import _astype_copy_false
 from ..exceptions import NotFittedError
 
@@ -46,6 +47,17 @@ __all__ = [
     "strip_accents_unicode",
     "strip_tags",
 ]
+
+if not IS_PYPY:
+    from ._hashing_fast import transform as _hashing_transform
+else:
+
+    def _hashing_transform(*args, **kwargs):
+        raise NotImplementedError(
+            "FeatureHasher is not compatible with PyPy (see "
+            "https://github.com/scikit-learn/scikit-learn/issues/11540 "
+            "for the status updates)."
+        )
 
 
 def _preprocess(doc, accent_function=None, lower=False):
@@ -744,6 +756,7 @@ class HashingVectorizer(TransformerMixin, _VectorizerMixin, BaseEstimator):
         norm="l2",
         alternate_sign=True,
         dtype=np.float64,
+        feature_hasher=None,
     ):
         self.input = input
         self.encoding = encoding
@@ -761,6 +774,7 @@ class HashingVectorizer(TransformerMixin, _VectorizerMixin, BaseEstimator):
         self.norm = norm
         self.alternate_sign = alternate_sign
         self.dtype = dtype
+        self.feature_hasher = feature_hasher
 
     def partial_fit(self, X, y=None):
         """No-op: this transformer is stateless.
@@ -808,7 +822,8 @@ class HashingVectorizer(TransformerMixin, _VectorizerMixin, BaseEstimator):
         self._warn_for_unused_params()
         self._validate_params()
 
-        self._get_hasher().fit(X, y=y)
+        analyzer = self.build_analyzer()
+        self._get_hasher().fit((analyzer(doc) for doc in X), y=y)
         return self
 
     def transform(self, X):
@@ -862,12 +877,15 @@ class HashingVectorizer(TransformerMixin, _VectorizerMixin, BaseEstimator):
         return self.fit(X, y).transform(X)
 
     def _get_hasher(self):
-        return FeatureHasher(
-            n_features=self.n_features,
-            input_type="string",
-            dtype=self.dtype,
-            alternate_sign=self.alternate_sign,
-        )
+        if self.feature_hasher == None:
+            return FeatureHasher(
+                n_features=self.n_features,
+                input_type="string",
+                dtype=self.dtype,
+                alternate_sign=self.alternate_sign,
+            )
+        else:
+            return self.feature_hasher
 
     def _more_tags(self):
         return {"X_types": ["string"]}
@@ -1023,6 +1041,25 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
     dtype : type, default=np.int64
         Type of the matrix returned by fit_transform() or transform().
 
+    out_of_vocab_features : int, default=None
+        If not None, will add the specified number of out-of-vocabulary
+        features counting the terms not in the vocabulary.
+        If set to 1, it will add a single feature as total count of the
+        out-of-vocab terms found per document.
+        If set to >1, on top of the single count feature above it will also
+        add the specified number of features to represent all out-of-vocab
+        terms through overlapping feature hashing count buckets. For example,
+        a value of 1024 will add a single feature counting the total out-of-
+        vocabulary terms, plus 1024 features from a hash-bag counting
+        out-of-vocabulary terms in overlapping buckets. Note hash bag uses
+        Murmurhash3 and the out-of-vocab terms will overlap into these
+        count buckets.
+        This option is often used in conjunction with feature trimming
+        `max_features`, `min_df`, `max_df`, and/or `vocabulary` options to
+        featurize the trimmed-off terms in a compact form.
+
+        .. versionadded:: 1.1.0
+
     Attributes
     ----------
     vocabulary_ : dict
@@ -1107,6 +1144,7 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
         vocabulary=None,
         binary=False,
         dtype=np.int64,
+        out_of_vocab_features=None,
     ):
         self.input = input
         self.encoding = encoding
@@ -1125,6 +1163,7 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
         self.vocabulary = vocabulary
         self.binary = binary
         self.dtype = dtype
+        self.out_of_vocab_features = out_of_vocab_features
 
     def _sort_features(self, X, vocabulary):
         """Sort features by name
@@ -1179,6 +1218,7 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
             raise ValueError(
                 "After pruning, no terms remain. Try a lower min_df or a higher max_df."
             )
+
         return X[:, kept_indices], removed_terms
 
     def _count_vocab(self, raw_documents, fixed_vocab):
@@ -1194,10 +1234,18 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
         j_indices = []
         indptr = []
 
+        if self.out_of_vocab_features and self.out_of_vocab_features > 1:
+            # For >1 out-of-vocabulary features, use a hashbag. Build
+            # the raw set of features to hash for this document.
+            oov_feature_counter_arr = []
+            oov_feature_counter = {}
+
         values = _make_int_array()
+        oov_count = 0
         indptr.append(0)
         for doc in raw_documents:
             feature_counter = {}
+
             for feature in analyze(doc):
                 try:
                     feature_idx = vocabulary[feature]
@@ -1206,11 +1254,32 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
                     else:
                         feature_counter[feature_idx] += 1
                 except KeyError:
-                    # Ignore out-of-vocabulary items for fixed_vocab=True
-                    continue
+                    # Out-of-vocabulary items map to out-of-vocabulary count
+                    if self.out_of_vocab_features and fixed_vocab:
+                        oov_count += 1
+                        if self.out_of_vocab_features > 1:
+                            if feature not in oov_feature_counter:
+                                oov_feature_counter[feature] = 1
+                            else:
+                                oov_feature_counter[feature] += 1
 
             j_indices.extend(feature_counter.keys())
             values.extend(feature_counter.values())
+
+            # Add the out-of-vocab features
+            if self.out_of_vocab_features and fixed_vocab:
+                # One count feature for out-of-vocabulary, add as last feature index
+                if oov_count > 0:
+                    j_indices.append(len(vocabulary))
+                    values.append(oov_count)
+                    oov_count = 0
+
+                if self.out_of_vocab_features > 1:
+                    # For >1 out of vocabulary features, also add a hashbag. Build
+                    # the raw set of features to hash for this document.
+                    oov_feature_counter_arr.append(oov_feature_counter)
+                    oov_feature_counter = {}
+
             indptr.append(len(j_indices))
 
         if not fixed_vocab:
@@ -1238,16 +1307,48 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
         indptr = np.asarray(indptr, dtype=indices_dtype)
         values = np.frombuffer(values, dtype=np.intc)
 
+        n_features = len(vocabulary)
+        if self.out_of_vocab_features:
+            # Out-of-vocab count feature
+            n_features += 1
+
         X = sp.csr_matrix(
             (values, j_indices, indptr),
-            shape=(len(indptr) - 1, len(vocabulary)),
+            shape=(len(indptr) - 1, n_features),
             dtype=self.dtype,
         )
+
+        if (
+            self.out_of_vocab_features
+            and self.out_of_vocab_features > 1
+            and fixed_vocab
+        ):
+            # Out-of-vocabulary hashbag is appended after the vocabulary
+            # counts.
+            oov_feature_counter_arr = (_iteritems(d) for d in oov_feature_counter_arr)
+            oov_indices, oov_indptr, oov_values = _hashing_transform(
+                oov_feature_counter_arr,
+                self.out_of_vocab_features,
+                self.dtype,
+                alternate_sign=False,
+                seed=0,
+            )
+
+            # Build the sparse hashbag out-of-vocab matrix
+            oov_X = sp.csr_matrix(
+                (oov_values, oov_indices, oov_indptr),
+                shape=(len(indptr) - 1, self.out_of_vocab_features),
+                dtype=self.dtype,
+            )
+
+            # Concat the sparse hashbag features
+            X = sp.hstack((X, oov_X), format="csr")
+
         X.sort_indices()
         return vocabulary, X
 
     def _validate_params(self):
-        """Validation of min_df, max_df and max_features"""
+        """Validation of min_df, max_df, max_features, and out_of_vocab_features"""
         super()._validate_params()
 
         if self.max_features is not None:
@@ -1262,6 +1363,14 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
             check_scalar(self.max_df, "max_df", numbers.Integral, min_val=0)
         else:
             check_scalar(self.max_df, "max_df", numbers.Real, min_val=0.0, max_val=1.0)
+
+        if self.out_of_vocab_features is not None:
+            check_scalar(
+                self.out_of_vocab_features,
+                "out_of_vocab_features",
+                numbers.Integral,
+                min_val=1,
+            )
 
     def fit(self, raw_documents, y=None):
         """Learn a vocabulary dictionary of all tokens in the raw documents.
@@ -1327,10 +1436,16 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
                     )
                     break
 
-        vocabulary, X = self._count_vocab(raw_documents, self.fixed_vocabulary_)
+        if (
+            self.out_of_vocab_features
+            and not self.fixed_vocabulary_
+            and hasattr(raw_documents, "__iter__")
+        ):
+            # We need to iterate through in the input twice for fitting when
+            # adding out-of-vocab features. Convert to list to not exhaust iterable.
+            raw_documents = list(raw_documents)
 
-        if self.binary:
-            X.data.fill(1)
+        vocabulary, X = self._count_vocab(raw_documents, self.fixed_vocabulary_)
 
         if not self.fixed_vocabulary_:
             n_doc = X.shape[0]
@@ -1350,6 +1465,14 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
             if max_features is None:
                 X = self._sort_features(X, vocabulary)
             self.vocabulary_ = vocabulary
+
+            if self.out_of_vocab_features:
+                # Re-compute the vocabulary counts now that we fixed the trimmed
+                # vocabulary so we can count the out-of-vocabulary features
+                vocabulary, X = self._count_vocab(raw_documents, fixed_vocab=True)
+
+        if self.binary:
+            X.data.fill(1)
 
         return X
 
@@ -1402,6 +1525,19 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
         terms = np.array(list(self.vocabulary_.keys()))
         indices = np.array(list(self.vocabulary_.values()))
         inverse_vocabulary = terms[np.argsort(indices)]
+
+        if self.out_of_vocab_features:
+            # Add out-of-vocab inverse vocabulary names
+
+            # Total out-of-vocab count feature name
+            inverse_vocabulary = np.append(inverse_vocabulary, "out_of_vocab_count")
+
+            if self.out_of_vocab_features > 1:
+                # Hashbag out-of-vocab feature names
+                oov_inverse_vocab = np.char.mod(
+                    "hash_%d", np.arange(0, self.out_of_vocab_features)
+                )
+                inverse_vocabulary = np.append(inverse_vocabulary, oov_inverse_vocab)
 
         if sp.issparse(X):
             return [
@@ -1861,6 +1997,25 @@ class TfidfVectorizer(CountVectorizer):
     sublinear_tf : bool, default=False
         Apply sublinear tf scaling, i.e. replace tf with 1 + log(tf).
 
+    out_of_vocab_features : int, default=None
+        If not None, will add the specified number of out-of-vocabulary
+        features counting the terms not in the vocabulary.
+        If set to 1, it will add a single feature as total count of the
+        out-of-vocab terms found per document.
+        If set to >1, on top of the single count feature above it will also
+        add the specified number of features to represent all out-of-vocab
+        terms through overlapping feature hashing count buckets. For example,
+        a value of 1024 will add a single feature counting the total out-of-
+        vocabulary terms, plus 1024 features from a hash-bag counting
+        out-of-vocabulary terms in overlapping buckets. Note hash bag uses
+        Murmurhash3 and the out-of-vocab terms will overlap into these
+        count buckets.
+        This option is often used in conjunction with feature trimming
+        `max_features`, `min_df`, `max_df`, and/or `vocabulary` options to
+        featurize the trimmed-off terms in a compact form.
+
+        .. versionadded:: 1.1.0
+
     Attributes
     ----------
     vocabulary_ : dict
@@ -1938,6 +2093,7 @@ class TfidfVectorizer(CountVectorizer):
         use_idf=True,
         smooth_idf=True,
         sublinear_tf=False,
+        out_of_vocab_features=None,
     ):
 
         super().__init__(
@@ -1958,6 +2114,7 @@ class TfidfVectorizer(CountVectorizer):
             vocabulary=vocabulary,
             binary=binary,
             dtype=dtype,
+            out_of_vocab_features=out_of_vocab_features,
         )
 
         self._tfidf = TfidfTransformer(
