@@ -2,7 +2,7 @@
 # License: BSD 3 clause
 
 from numbers import Integral
-from bloom_filter2 import BloomFilter
+from pybloom import BloomFilter
 
 from itertools import chain
 
@@ -339,8 +339,8 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
                 # Use Chi (observed - expected) to find the feature weight
                 # for stratification
                 observed = (x["c_pos"] for x in vocab.values())
-                expected = (x["c"] for x in vocab.values()) * y_mean
-                rank = observed - expected
+                expected = (x["c"] * y_mean for x in vocab.values())
+                rank = tuple(map(lambda o, e: o - e, observed, expected))
 
             elif self.bloom_strat_type == "lr":
                 # TODO: OR use Logistic Regression to learn the feature weight
@@ -380,7 +380,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
 
             # Create and fit the bloom filter
             bloom = BloomFilter(
-                max_elements=len(f), error_rate=self.bloom_filter_error_rate
+                capacity=len(f), error_rate=self.bloom_filter_error_rate
             )
             for feature_name in f:
                 bloom.add(feature_name)
