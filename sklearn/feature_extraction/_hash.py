@@ -303,7 +303,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
             FeatureHasher class instance.
         """
         # repeat input validation for grid search (which calls set_params)
-        self._validate_params(self.n_features, self.input_type)
+        self._validate_params()
 
         X = iter(X)
         if self.input_type == "dict":
@@ -320,7 +320,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
                 # Add the features to the vocabulary
                 if v is not None:
                     if v not in vocab:
-                        vocab[v] = {"c": c, "t_sum": Y * c}
+                        vocab[v] = {"c": c, "c_pos": Y * c}
                     else:
                         vocab[v]["c"] += c
                         vocab[v]["c_pos"] += Y * c
