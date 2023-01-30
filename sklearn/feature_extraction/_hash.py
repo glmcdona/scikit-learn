@@ -270,6 +270,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
         alternate_sign=True,
         bloom_count=1,
         bloom_filter_error_rate=0.05,
+        bloom_strat_type="chi",
         min_term_count=None,
     ):
         self.dtype = dtype
@@ -280,24 +281,29 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
         self.min_term_count = min_term_count
         self.bloom_count = bloom_count
         self.bloom_filter_error_rate = bloom_filter_error_rate
+        self.bloom_strat_type = bloom_strat_type
 
     def fit(self, X=None, y=None):
         """No-op.
+
         This method doesn't do anything. It exists purely for compatibility
         with the scikit-learn transformer API.
+
         Parameters
         ----------
         X : Ignored
             Not used, present here for API consistency by convention.
+
         y : Ignored
             Not used, present here for API consistency by convention.
+
         Returns
         -------
         self : object
             FeatureHasher class instance.
         """
         # repeat input validation for grid search (which calls set_params)
-        self._validate_params()
+        self._validate_params(self.n_features, self.input_type)
 
         X = iter(X)
         if self.input_type == "dict":
@@ -307,7 +313,9 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
 
         # Count the vocabulary
         vocab = {}
+        y_mean = 0
         for x, Y in zip(X, y):
+            y_mean += Y
             for v, c in x:
                 # Add the features to the vocabulary
                 if v is not None:
@@ -315,29 +323,46 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
                         vocab[v] = {"c": c, "t_sum": Y * c}
                     else:
                         vocab[v]["c"] += c
-                        vocab[v]["t_sum"] += Y * c
+                        vocab[v]["c_pos"] += Y * c
+        y_mean = y_mean / len(y)
 
         if self.min_term_count and self.min_term_count > 1:
             # Apply minimum count filter
-            feature_names = list(vocab.keys())
+            feature_names = vocab.keys()
             for feature_name in feature_names:
                 if vocab[feature_name]["c"] < self.min_term_count:
                     del vocab[feature_name]
 
-        # Extract the keys and target sum
-        feature_names = list(vocab.keys())
-        feature_target_sums = [x["t_sum"] for x in vocab.values()]
-
-        # Build the vocabulary per bloom filter bucket
         if self.bloom_count > 1:
-            # Sorting is needed by total target weight per feature
-            feature_target_sums, feature_names = zip(
-                *sorted(zip(feature_target_sums, feature_names))
+            # Add feature weights for stratification
+            if self.bloom_strat_type == "chi":
+                # Use Chi (observed - expected) to find the feature weight
+                # for stratification
+                observed = (x["c_pos"] for x in vocab.values())
+                expected = (x["c"] for x in vocab.values()) * y_mean
+                rank = observed - expected
+
+            elif self.bloom_strat_type == "lr":
+                # TODO: OR use Logistic Regression to learn the feature weight
+                raise NotImplementedError("Logistic Regression is not implemented yet.")
+
+            else:
+                raise ValueError("Unknown bloom_strat_type: %s" % self.bloom_strat_type)
+
+            # Order the feature_names array by the feature weight
+            feature_names = list(vocab.keys())
+            feature_ranks = list(rank)
+            feature_ranks, feature_names = zip(
+                *sorted(zip(feature_ranks, feature_names))
             )
+        else:
+            # No stratification
+            feature_names = list(vocab.keys())
+            feature_ranks = [0] * len(feature_names)
 
         # Debug logging. TODO: Remove.
         self._feature_names = feature_names
-        self._feature_target_sums = feature_target_sums
+        self._feature_ranks = feature_ranks
 
         # Now build the bloom filter vocabularies
         self.bloom_filters = []
