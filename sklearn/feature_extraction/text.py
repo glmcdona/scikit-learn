@@ -29,7 +29,7 @@ from ..preprocessing import normalize
 from ._hash import FeatureHasher
 from ._stop_words import ENGLISH_STOP_WORDS
 from ..utils.validation import check_is_fitted, check_array, FLOAT_DTYPES
-from ..utils import _IS_32BIT
+from ..utils import _IS_32BIT, IS_PYPY
 from ..exceptions import NotFittedError
 from ..utils._param_validation import StrOptions, Interval, HasMethods
 
@@ -44,6 +44,17 @@ __all__ = [
     "strip_accents_unicode",
     "strip_tags",
 ]
+
+if not IS_PYPY:
+    from ._hashing_fast import transform as _hashing_transform
+else:
+
+    def _hashing_transform(*args, **kwargs):
+        raise NotImplementedError(
+            "FeatureHasher is not compatible with PyPy (see "
+            "https://github.com/scikit-learn/scikit-learn/issues/11540 "
+            "for the status updates)."
+        )
 
 
 def _preprocess(doc, accent_function=None, lower=False):
@@ -784,6 +795,7 @@ class HashingVectorizer(
         norm="l2",
         alternate_sign=True,
         dtype=np.float64,
+        feature_hasher=None,
     ):
         self.input = input
         self.encoding = encoding
@@ -801,6 +813,7 @@ class HashingVectorizer(
         self.norm = norm
         self.alternate_sign = alternate_sign
         self.dtype = dtype
+        self.feature_hasher = feature_hasher
 
     def partial_fit(self, X, y=None):
         """Only validates estimator's parameters.
@@ -855,7 +868,8 @@ class HashingVectorizer(
         self._warn_for_unused_params()
         self._validate_ngram_range()
 
-        self._get_hasher().fit(X, y=y)
+        analyzer = self.build_analyzer()
+        self._get_hasher().fit((analyzer(doc) for doc in X), y=y)
         return self
 
     def transform(self, X):
@@ -909,12 +923,15 @@ class HashingVectorizer(
         return self.fit(X, y).transform(X)
 
     def _get_hasher(self):
-        return FeatureHasher(
-            n_features=self.n_features,
-            input_type="string",
-            dtype=self.dtype,
-            alternate_sign=self.alternate_sign,
-        )
+        if self.feature_hasher is None:
+            return FeatureHasher(
+                n_features=self.n_features,
+                input_type="string",
+                dtype=self.dtype,
+                alternate_sign=self.alternate_sign,
+            )
+        else:
+            return self.feature_hasher
 
     def _more_tags(self):
         return {"X_types": ["string"]}
