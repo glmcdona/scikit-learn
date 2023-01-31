@@ -5,7 +5,7 @@ images.
 """
 
 from ._dict_vectorizer import DictVectorizer
-from ._hash import FeatureHasher
+from ._hash import FeatureHasher, BloomFilterFeatureHashers
 from .image import img_to_graph, grid_to_graph
 from . import text
 
@@ -16,4 +16,5 @@ __all__ = [
     "grid_to_graph",
     "text",
     "FeatureHasher",
+    "BloomFilterFeatureHashers",
 ]
