@@ -336,11 +336,14 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
         if self.bloom_count > 1:
             # Add feature weights for stratification
             if self.bloom_strat_type == "chi":
-                # Use Chi (observed - expected) to find the feature weight
-                # for stratification
+                # Use normalized Chi (observed - expected)/n_occurences to find the
+                # feature weight for stratification
+                total = (x["c"] for x in vocab.values())
                 observed = (x["c_pos"] for x in vocab.values())
                 expected = (x["c"] * y_mean for x in vocab.values())
-                rank = tuple(map(lambda o, e: o - e, observed, expected))
+                rank = tuple(
+                    map(lambda t, o, e: (o - e) / t, total, observed, expected)
+                )
 
             elif self.bloom_strat_type == "lr":
                 # TODO: OR use Logistic Regression to learn the feature weight
