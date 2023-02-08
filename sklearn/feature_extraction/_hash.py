@@ -496,7 +496,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
 
             # Create and fit the bloom filter
             bloom = BloomFilter(
-                capacity=max(len(f), 1000), error_rate=self.bloom_filter_error_rate
+                capacity=len(f), error_rate=self.bloom_filter_error_rate
             )
             for feature_name in f:
                 bloom.add(feature_name)
