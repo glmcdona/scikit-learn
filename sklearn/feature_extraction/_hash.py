@@ -197,6 +197,119 @@ class FeatureHasher(TransformerMixin, BaseEstimator):
         return {"X_types": [self.input_type]}
 
 
+class BloomBags(TransformerMixin, BaseEstimator):
+    _parameter_constraints: dict = {
+        "n_bags": [Interval(Integral, 1, np.iinfo(np.int32).max, closed="both")],
+        "input_type": [StrOptions({"dict", "pair", "string"})],
+        "dtype": "no_validation",  # delegate to numpy
+        "alternate_sign": ["boolean"],
+    }
+
+    def __init__(
+        self,
+        n_bags=100,
+        *,
+        input_type="dict",
+        dtype=np.float64,
+        error_rate=0.05,
+        feature_rank=[],
+    ):
+        self.dtype = dtype
+        self.input_type = input_type
+        self.error_rate = error_rate
+
+        self.n_bags = n_bags
+        self.feature_rank = feature_rank
+
+        if self.n_bags > len(self.feature_rank):
+            self.n_bags = len(self.feature_rank)
+            print(
+                f"WARNING: n_bags reduced to {self.n_bags} to match feature_rank length"
+            )
+
+    def fit(self, X=None, y=None):
+        """
+
+        Parameters
+        ----------
+        X : Ignored
+            Not used, present here for API consistency by convention.
+
+        y : Ignored
+            Not used, present here for API consistency by convention.
+
+        Returns
+        -------
+        self : object
+            FeatureHasher class instance.
+        """
+        # repeat input validation for grid search (which calls set_params)
+        self._validate_params()
+
+        # Now build the bloom filter vocabularies
+        self.bloom_filters = []
+        bucket_size = int(len(self.feature_rank) / self.n_bags)
+
+        for i in range(self.n_bags):
+            # Build the list of bloom filters, matching to each set of features
+            # in the bucket
+            if i == self.n_bags - 1:
+                # Last bucket may have more features
+                f = self.feature_rank[i * bucket_size :]
+            else:
+                f = self.feature_rank[i * bucket_size : (i + 1) * bucket_size]
+
+            # Create and fit the bloom filter
+            bloom = BloomFilter(capacity=len(f), error_rate=self.error_rate)
+            for feature_name in f:
+                bloom.add(feature_name)
+            self.bloom_filters.append(bloom)
+
+        return self
+
+    def transform(self, X):
+        """Transform a sequence of instances to a scipy.sparse matrix.
+        Parameters
+        ----------
+        X : iterable over iterable over raw features, length = n_samples
+            Samples. Each sample must be iterable an (e.g., a list or tuple)
+            containing/generating feature names (and optionally values, see
+            the input_type constructor argument) which will be hashed.
+            raw_X need not support the len function, so it can be the result
+            of a generator; n_samples is determined on the fly.
+        Returns
+        -------
+        X : sparse matrix of shape (n_samples, n_features)
+            Feature matrix, for use with estimators or further transformers.
+        """
+        # Process everything as sparse regardless of setting
+        X = iter(X)
+        if self.input_type == "dict":
+            X = (_iteritems(d) for d in X)
+        elif self.input_type == "string":
+            X = (((f, 1) for f in x) for x in X)
+
+        # X_by_bloombag = np.zeros((len(X), self.n_bags), dtype=np.int16)
+        X_by_bloombag = []
+
+        for row, x in enumerate(X):
+            x = list(x)
+            X_by_bloombag.append([0] * self.n_bags)
+
+            # Iterate values in row
+            for v, c in x:
+                # Iterate over the bloom filters
+                for i, bloom in enumerate(self.bloom_filters):
+                    if v in bloom:
+                        # Add count
+                        X_by_bloombag[row][i] += 1
+
+        return np.array(X_by_bloombag)
+
+    def _more_tags(self):
+        return {"X_types": [self.input_type]}
+
+
 class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
     """Implements feature hashing, aka the hashing trick.
     This class turns sequences of symbolic feature names (strings) into
@@ -383,7 +496,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
 
             # Create and fit the bloom filter
             bloom = BloomFilter(
-                capacity=len(f), error_rate=self.bloom_filter_error_rate
+                capacity=max(len(f), 1000), error_rate=self.bloom_filter_error_rate
             )
             for feature_name in f:
                 bloom.add(feature_name)
