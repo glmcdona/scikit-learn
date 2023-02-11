@@ -2,7 +2,7 @@
 # License: BSD 3 clause
 
 from numbers import Integral
-from pybloom import BloomFilter
+from fastbloom_rs import BloomFilter
 
 from itertools import chain
 
@@ -197,62 +197,137 @@ class FeatureHasher(TransformerMixin, BaseEstimator):
         return {"X_types": [self.input_type]}
 
 
+class BloomBags(TransformerMixin, BaseEstimator):
+    _parameter_constraints: dict = {
+        "n_bags": [Interval(Integral, 1, np.iinfo(np.int32).max, closed="both")],
+        "input_type": [StrOptions({"dict", "pair", "string"})],
+        "dtype": "no_validation",  # delegate to numpy
+        "alternate_sign": ["boolean"],
+    }
+
+    def __init__(
+        self,
+        n_bags=100,
+        *,
+        input_type="dict",
+        dtype=np.float64,
+        error_rate=0.05,
+        feature_rank=[],
+    ):
+        self.dtype = dtype
+        self.input_type = input_type
+        self.error_rate = error_rate
+
+        self.n_bags = n_bags
+        self.feature_rank = feature_rank
+
+        if self.n_bags > len(self.feature_rank):
+            self.n_bags = len(self.feature_rank)
+            print(
+                f"WARNING: n_bags reduced to {self.n_bags} to match feature_rank length"
+            )
+
+    def fit(self, X=None, y=None):
+        """
+
+        Parameters
+        ----------
+        X : Ignored
+            Not used, present here for API consistency by convention.
+
+        y : Ignored
+            Not used, present here for API consistency by convention.
+
+        Returns
+        -------
+        self : object
+            FeatureHasher class instance.
+        """
+        # repeat input validation for grid search (which calls set_params)
+        self._validate_params()
+
+        # Now build the bloom filter vocabularies
+        self.bloom_filters = []
+        bucket_size = len(self.feature_rank) / self.n_bags
+        bucket_size_max = int(np.ceil(bucket_size))
+
+        for i in range(self.n_bags):
+            # Build the list of bloom filters, matching to each set of features
+            # in the bucket
+            if i == self.n_bags - 1:
+                # Last bucket may have more features
+                f = self.feature_rank[int(i * bucket_size) :]
+            else:
+                f = self.feature_rank[int(i * bucket_size) : int((i + 1) * bucket_size)]
+
+            # Create and fit the bloom filter
+            bloom = BloomFilter(bucket_size_max, self.error_rate)
+            # bloom.add_str_batch(f)
+            for feature in f:
+                bloom.add(feature)
+
+            self.bloom_filters.append(bloom)
+
+        return self
+
+    def get_size_in_bytes(self):
+        """
+        Returns the size in bytes of this set of BloomBags
+        """
+        size = 0
+        for bloom in self.bloom_filters:
+            size += len(bloom.get_bytes())
+
+        return size
+
+    def transform(self, X):
+        """Transform a sequence of instances to a scipy.sparse matrix.
+        Parameters
+        ----------
+        X : iterable over iterable over raw features, length = n_samples
+            Samples. Each sample must be iterable an (e.g., a list or tuple)
+            containing/generating feature names (and optionally values, see
+            the input_type constructor argument) which will be hashed.
+            raw_X need not support the len function, so it can be the result
+            of a generator; n_samples is determined on the fly.
+        Returns
+        -------
+        X : sparse matrix of shape (n_samples, n_features)
+            Feature matrix, for use with estimators or further transformers.
+        """
+        # Process everything as sparse regardless of setting
+        X = iter(X)
+        if self.input_type == "dict":
+            X = (_iteritems(d) for d in X)
+        elif self.input_type == "string":
+            X = (((f, 1) for f in x) for x in X)
+
+        # X_by_bloombag = np.zeros((len(X), self.n_bags), dtype=np.int16)
+        X_by_bloombag = []
+
+        for row, x in enumerate(X):
+            x = list(x)
+            X_by_bloombag.append([0] * self.n_bags)
+
+            # Iterate values in row
+            for v, c in x:
+                feature_hash_indices = None
+
+                # Iterate over the bloom filters
+                for i, bloom in enumerate(self.bloom_filters):
+                    if feature_hash_indices is None:
+                        feature_hash_indices = bloom.get_hash_indices(v)
+                    if bloom.contains_hash_indices(feature_hash_indices):
+                        # Add count
+                        X_by_bloombag[row][i] += 1
+
+        return np.array(X_by_bloombag)
+
+    def _more_tags(self):
+        return {"X_types": [self.input_type]}
+
+
 class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
-    """Implements feature hashing, aka the hashing trick.
-    This class turns sequences of symbolic feature names (strings) into
-    scipy.sparse matrices, using a hash function to compute the matrix column
-    corresponding to a name. The hash function employed is the signed 32-bit
-    version of Murmurhash3.
-    Feature names of type byte string are used as-is. Unicode strings are
-    converted to UTF-8 first, but no Unicode normalization is done.
-    Feature values must be (finite) numbers.
-    This class is a low-memory alternative to DictVectorizer and
-    CountVectorizer, intended for large-scale (online) learning and situations
-    where memory is tight, e.g. when running prediction code on embedded
-    devices.
-    Read more in the :ref:`User Guide <feature_hashing>`.
-    .. versionadded:: 0.13
-    Parameters
-    ----------
-    n_features : int, default=2**20
-        The number of features (columns) in the output matrices. Small numbers
-        of features are likely to cause hash collisions, but large numbers
-        will cause larger coefficient dimensions in linear learners.
-    input_type : str, default='dict'
-        Choose a string from {'dict', 'pair', 'string'}.
-        Either "dict" (the default) to accept dictionaries over
-        (feature_name, value); "pair" to accept pairs of (feature_name, value);
-        or "string" to accept single strings.
-        feature_name should be a string, while value should be a number.
-        In the case of "string", a value of 1 is implied.
-        The feature_name is hashed to find the appropriate column for the
-        feature. The value's sign might be flipped in the output (but see
-        non_negative, below).
-    dtype : numpy dtype, default=np.float64
-        The type of feature values. Passed to scipy.sparse matrix constructors
-        as the dtype argument. Do not set this to bool, np.boolean or any
-        unsigned integer type.
-    alternate_sign : bool, default=True
-        When True, an alternating sign is added to the features as to
-        approximately conserve the inner product in the hashed space even for
-        small n_features. This approach is similar to sparse random projection.
-        .. versionchanged:: 0.19
-            ``alternate_sign`` replaces the now deprecated ``non_negative``
-            parameter.
-    See Also
-    --------
-    DictVectorizer : Vectorizes string-valued features using a hash table.
-    sklearn.preprocessing.OneHotEncoder : Handles nominal/categorical features.
-    Examples
-    --------
-    >>> from sklearn.feature_extraction import FeatureHasher
-    >>> h = FeatureHasher(n_features=10)
-    >>> D = [{'dog': 1, 'cat':2, 'elephant':4},{'dog': 2, 'run': 5}]
-    >>> f = h.transform(D)
-    >>> f.toarray()
-    array([[ 0.,  0., -4., -1.,  0.,  0.,  0.,  0.,  0.,  2.],
-           [ 0.,  0.,  0., -2., -5.,  0.,  0.,  0.,  0.,  0.]])
-    """
 
     _parameter_constraints: dict = {
         "n_features": [Interval(Integral, 1, np.iinfo(np.int32).max, closed="both")],
@@ -272,6 +347,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
         bloom_filter_error_rate=0.05,
         bloom_strat_type="chi",
         min_term_count=None,
+        feature_rank=None,
     ):
         self.dtype = dtype
         self.input_type = input_type
@@ -282,6 +358,7 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
         self.bloom_count = bloom_count
         self.bloom_filter_error_rate = bloom_filter_error_rate
         self.bloom_strat_type = bloom_strat_type
+        self.feature_rank = feature_rank
 
     def fit(self, X=None, y=None):
         """No-op.
@@ -335,6 +412,11 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
 
         if self.bloom_count > 1:
             # Add feature weights for stratification
+            if self.feature_rank:
+                # Use the provided feature rank to find the feature weight
+                # for stratification
+                print("Using provided feature rank")
+                feature_names = self.feature_rank
             if self.bloom_strat_type == "chi":
                 # Use normalized Chi (observed - expected)/n_occurences to find the
                 # feature weight for stratification
@@ -345,19 +427,19 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
                     map(lambda t, o, e: (o - e) / t, total, observed, expected)
                 )
 
+                # Order the feature_names array by the feature weight
+                feature_names = list(vocab.keys())
+                feature_ranks = list(rank)
+                feature_ranks, feature_names = zip(
+                    *sorted(zip(feature_ranks, feature_names))
+                )
+
             elif self.bloom_strat_type == "lr":
                 # TODO: OR use Logistic Regression to learn the feature weight
                 raise NotImplementedError("Logistic Regression is not implemented yet.")
 
             else:
                 raise ValueError("Unknown bloom_strat_type: %s" % self.bloom_strat_type)
-
-            # Order the feature_names array by the feature weight
-            feature_names = list(vocab.keys())
-            feature_ranks = list(rank)
-            feature_ranks, feature_names = zip(
-                *sorted(zip(feature_ranks, feature_names))
-            )
         else:
             # No stratification
             feature_names = list(vocab.keys())
@@ -382,11 +464,10 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
                 f = feature_names[i * bucket_size : (i + 1) * bucket_size]
 
             # Create and fit the bloom filter
-            bloom = BloomFilter(
-                capacity=len(f), error_rate=self.bloom_filter_error_rate
-            )
-            for feature_name in f:
-                bloom.add(feature_name)
+            bloom = BloomFilter(len(f), self.bloom_filter_error_rate)
+            # bloom.add_str_batch(f)
+            for feature in f:
+                bloom.add_str(feature)
             self.bloom_filters.append(bloom)
 
             # Create and fit the hash bag
