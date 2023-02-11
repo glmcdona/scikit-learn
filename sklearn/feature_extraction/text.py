@@ -26,12 +26,14 @@ import scipy.sparse as sp
 
 from ..base import BaseEstimator, TransformerMixin, OneToOneFeatureMixin
 from ..preprocessing import normalize
-from ._hash import FeatureHasher
+from ._hash import FeatureHasher, BloomBags
 from ._stop_words import ENGLISH_STOP_WORDS
 from ..utils.validation import check_is_fitted, check_array, FLOAT_DTYPES
 from ..utils import _IS_32BIT, IS_PYPY
 from ..exceptions import NotFittedError
 from ..utils._param_validation import StrOptions, Interval, HasMethods
+from ..linear_model import LogisticRegression
+from ..pipeline import Pipeline
 
 
 __all__ = [
@@ -575,6 +577,419 @@ class _VectorizerMixin:
                     "The parameter 'tokenizer' will not be used"
                     " since 'analyzer' != 'word'"
                 )
+
+
+class BloomVectorizer(
+    TransformerMixin, _VectorizerMixin, BaseEstimator, auto_wrap_output_keys=None
+):
+    r"""Convert a collection of text documents to a matrix of token occurrences.
+
+    It turns a collection of text documents into a scipy.sparse matrix holding
+    token occurrence counts (or binary occurrence information), possibly
+    normalized as token frequencies if norm='l1' or projected on the euclidean
+    unit sphere if norm='l2'.
+
+    This text vectorizer implementation uses the hashing trick to find the
+    token string name to feature integer index mapping.
+
+    This strategy has several advantages:
+
+    - it is very low memory scalable to large datasets as there is no need to
+      store a vocabulary dictionary in memory.
+
+    - it is fast to pickle and un-pickle as it holds no state besides the
+      constructor parameters.
+
+    - it can be used in a streaming (partial fit) or parallel pipeline as there
+      is no state computed during fit.
+
+    There are also a couple of cons (vs using a CountVectorizer with an
+    in-memory vocabulary):
+
+    - there is no way to compute the inverse transform (from feature indices to
+      string feature names) which can be a problem when trying to introspect
+      which features are most important to a model.
+
+    - there can be collisions: distinct tokens can be mapped to the same
+      feature index. However in practice this is rarely an issue if n_features
+      is large enough (e.g. 2 ** 18 for text classification problems).
+
+    - no IDF weighting as this would render the transformer stateful.
+
+    The hash function employed is the signed 32-bit version of Murmurhash3.
+
+    Read more in the :ref:`User Guide <text_feature_extraction>`.
+
+    Parameters
+    ----------
+    input : {'filename', 'file', 'content'}, default='content'
+        - If `'filename'`, the sequence passed as an argument to fit is
+          expected to be a list of filenames that need reading to fetch
+          the raw content to analyze.
+
+        - If `'file'`, the sequence items must have a 'read' method (file-like
+          object) that is called to fetch the bytes in memory.
+
+        - If `'content'`, the input is expected to be a sequence of items that
+          can be of type string or byte.
+
+    encoding : str, default='utf-8'
+        If bytes or files are given to analyze, this encoding is used to
+        decode.
+
+    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
+        Instruction on what to do if a byte sequence is given to analyze that
+        contains characters not of the given `encoding`. By default, it is
+        'strict', meaning that a UnicodeDecodeError will be raised. Other
+        values are 'ignore' and 'replace'.
+
+    strip_accents : {'ascii', 'unicode'} or callable, default=None
+        Remove accents and perform other character normalization
+        during the preprocessing step.
+        'ascii' is a fast method that only works on characters that have
+        a direct ASCII mapping.
+        'unicode' is a slightly slower method that works on any character.
+        None (default) does nothing.
+
+        Both 'ascii' and 'unicode' use NFKD normalization from
+        :func:`unicodedata.normalize`.
+
+    lowercase : bool, default=True
+        Convert all characters to lowercase before tokenizing.
+
+    preprocessor : callable, default=None
+        Override the preprocessing (string transformation) stage while
+        preserving the tokenizing and n-grams generation steps.
+        Only applies if ``analyzer`` is not callable.
+
+    tokenizer : callable, default=None
+        Override the string tokenization step while preserving the
+        preprocessing and n-grams generation steps.
+        Only applies if ``analyzer == 'word'``.
+
+    stop_words : {'english'}, list, default=None
+        If 'english', a built-in stop word list for English is used.
+        There are several known issues with 'english' and you should
+        consider an alternative (see :ref:`stop_words`).
+
+        If a list, that list is assumed to contain stop words, all of which
+        will be removed from the resulting tokens.
+        Only applies if ``analyzer == 'word'``.
+
+    token_pattern : str or None, default=r"(?u)\\b\\w\\w+\\b"
+        Regular expression denoting what constitutes a "token", only used
+        if ``analyzer == 'word'``. The default regexp selects tokens of 2
+        or more alphanumeric characters (punctuation is completely ignored
+        and always treated as a token separator).
+
+        If there is a capturing group in token_pattern then the
+        captured group content, not the entire match, becomes the token.
+        At most one capturing group is permitted.
+
+    ngram_range : tuple (min_n, max_n), default=(1, 1)
+        The lower and upper boundary of the range of n-values for different
+        n-grams to be extracted. All values of n such that min_n <= n <= max_n
+        will be used. For example an ``ngram_range`` of ``(1, 1)`` means only
+        unigrams, ``(1, 2)`` means unigrams and bigrams, and ``(2, 2)`` means
+        only bigrams.
+        Only applies if ``analyzer`` is not callable.
+
+    analyzer : {'word', 'char', 'char_wb'} or callable, default='word'
+        Whether the feature should be made of word or character n-grams.
+        Option 'char_wb' creates character n-grams only from text inside
+        word boundaries; n-grams at the edges of words are padded with space.
+
+        If a callable is passed it is used to extract the sequence of features
+        out of the raw, unprocessed input.
+
+        .. versionchanged:: 0.21
+            Since v0.21, if ``input`` is ``'filename'`` or ``'file'``, the data
+            is first read from the file and then passed to the given callable
+            analyzer.
+
+    n_features : int, default=(2 ** 20)
+        The number of features (columns) in the output matrices. Small numbers
+        of features are likely to cause hash collisions, but large numbers
+        will cause larger coefficient dimensions in linear learners.
+
+    binary : bool, default=False
+        If True, all non zero counts are set to 1. This is useful for discrete
+        probabilistic models that model binary events rather than integer
+        counts.
+
+    norm : {'l1', 'l2'}, default='l2'
+        Norm used to normalize term vectors. None for no normalization.
+
+    alternate_sign : bool, default=True
+        When True, an alternating sign is added to the features as to
+        approximately conserve the inner product in the hashed space even for
+        small n_features. This approach is similar to sparse random projection.
+
+        .. versionadded:: 0.19
+
+    dtype : type, default=np.float64
+        Type of the matrix returned by fit_transform() or transform().
+
+    See Also
+    --------
+    CountVectorizer : Convert a collection of text documents to a matrix of
+        token counts.
+    TfidfVectorizer : Convert a collection of raw documents to a matrix of
+        TF-IDF features.
+
+    Notes
+    -----
+    This estimator is :term:`stateless` and does not need to be fitted.
+    However, we recommend to call :meth:`fit_transform` instead of
+    :meth:`transform`, as parameter validation is only performed in
+    :meth:`fit`.
+
+    Examples
+    --------
+    >>> from sklearn.feature_extraction.text import HashingVectorizer
+    >>> corpus = [
+    ...     'This is the first document.',
+    ...     'This document is the second document.',
+    ...     'And this is the third one.',
+    ...     'Is this the first document?',
+    ... ]
+    >>> vectorizer = HashingVectorizer(n_features=2**4)
+    >>> X = vectorizer.fit_transform(corpus)
+    >>> print(X.shape)
+    (4, 16)
+    """
+
+    _parameter_constraints: dict = {
+        "input": [StrOptions({"filename", "file", "content"})],
+        "encoding": [str],
+        "decode_error": [StrOptions({"strict", "ignore", "replace"})],
+        "strip_accents": [StrOptions({"ascii", "unicode"}), None, callable],
+        "lowercase": ["boolean"],
+        "preprocessor": [callable, None],
+        "tokenizer": [callable, None],
+        "stop_words": [StrOptions({"english"}), list, None],
+        "token_pattern": [str, None],
+        "ngram_range": [tuple],
+        "analyzer": [StrOptions({"word", "char", "char_wb"}), callable],
+        "n_features": [Interval(Integral, 1, np.iinfo(np.int32).max, closed="left")],
+        "binary": ["boolean"],
+        "norm": [StrOptions({"l1", "l2"}), None],
+        "alternate_sign": ["boolean"],
+        "dtype": "no_validation",  # delegate to numpy
+    }
+
+    def __init__(
+        self,
+        *,
+        input="content",
+        encoding="utf-8",
+        decode_error="strict",
+        strip_accents=None,
+        lowercase=True,
+        preprocessor=None,
+        tokenizer=None,
+        stop_words=None,
+        token_pattern=r"(?u)\b\w\w+\b",
+        ngram_range=(1, 1),
+        analyzer="word",
+        n_features=None,
+        n_bags=5,
+        error_rate=0.01,
+        feature_rank=None,
+        binary=False,
+        norm="l2",
+        dtype=np.float64,
+    ):
+        self.input = input
+        self.encoding = encoding
+        self.decode_error = decode_error
+        self.strip_accents = strip_accents
+        self.preprocessor = preprocessor
+        self.tokenizer = tokenizer
+        self.analyzer = analyzer
+        self.lowercase = lowercase
+        self.token_pattern = token_pattern
+        self.stop_words = stop_words
+        self.n_features = n_features
+        self.n_bags = n_bags
+        self.error_rate = error_rate
+        self.feature_rank = feature_rank
+        self.ngram_range = ngram_range
+        self.binary = binary
+        self.norm = norm
+        self.dtype = dtype
+        self.bloom_bag = None
+
+        if feature_rank is not None and n_features is not None:
+            raise ValueError(
+                "n_features and feature_rank cannot be set at the same time"
+            )
+
+    def partial_fit(self, X, y=None):
+        """Only validates estimator's parameters.
+
+        This method allows to: (i) validate the estimator's parameters and
+        (ii) be consistent with the scikit-learn transformer API.
+
+        Parameters
+        ----------
+        X : ndarray of shape [n_samples, n_features]
+            Training data.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        Returns
+        -------
+        self : object
+            HashingVectorizer instance.
+        """
+        # TODO: only validate during the first call
+        self._validate_params()
+        return self
+
+    def _rank_features(self, X, y, n_features):
+        """Run feature ranking.
+
+        Parameters
+        ----------
+        X : ndarray of shape [n_samples, n_features]
+            Training data.
+
+        y : ndarray of shape [n_samples]
+            Target values.
+
+        n_features : int
+            Number of features to select.
+
+        Returns
+        -------
+        ranked_features : ndarray of shape [n_features]
+            Ranked features.
+        """
+        if self.feature_rank is not None:
+            return self.feature_rank
+
+        pipeline = Pipeline(
+            [
+                (
+                    "features",
+                    CountVectorizer(tokenizer=self.tokenizer, max_features=n_features),
+                ),
+                ("classifier", LogisticRegression(solver="lbfgs", max_iter=1000)),
+            ]
+        )
+        pipeline.fit(X, y)
+        weights = pipeline.named_steps["classifier"].coef_
+        feature_names = pipeline.named_steps["features"].vocabulary_
+        feature_names = [
+            feature
+            for feature, index in sorted(feature_names.items(), key=lambda x: x[1])
+        ]
+        ordered_features = [
+            feature
+            for weight, feature in sorted(zip(weights[0], feature_names), reverse=True)
+        ]
+
+        return ordered_features
+
+    def fit(self, X, y=None):
+        """Only validates estimator's parameters.
+
+        This method allows to: (i) validate the estimator's parameters and
+        (ii) be consistent with the scikit-learn transformer API.
+
+        Parameters
+        ----------
+        X : ndarray of shape [n_samples, n_features]
+            Training data.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        Returns
+        -------
+        self : object
+            HashingVectorizer instance.
+        """
+        self._validate_params()
+
+        # triggers a parameter validation
+        if isinstance(X, str):
+            raise ValueError(
+                "Iterable over raw text documents expected, string object received."
+            )
+
+        self._warn_for_unused_params()
+        self._validate_ngram_range()
+
+        # Run feature ranking
+        self.ranked_features = self._rank_features(X, y, self.n_features)
+
+        # Build the bloom bag
+        self.bloom_bag = BloomBags(
+            n_bags=self.n_bags,
+            error_rate=self.error_rate,
+            input_type="string",
+            feature_rank=self.ranked_features,
+        )
+
+        analyzer = self.build_analyzer()
+        self.bloom_bag.fit((analyzer(doc) for doc in X), y=y)
+        return self
+
+    def transform(self, X):
+        """Transform a sequence of documents to a document-term matrix.
+
+        Parameters
+        ----------
+        X : iterable over raw text documents, length = n_samples
+            Samples. Each sample must be a text document (either bytes or
+            unicode strings, file name or file object depending on the
+            constructor argument) which will be tokenized and hashed.
+
+        Returns
+        -------
+        X : sparse matrix of shape (n_samples, n_features)
+            Document-term matrix.
+        """
+        if isinstance(X, str):
+            raise ValueError(
+                "Iterable over raw text documents expected, string object received."
+            )
+
+        self._validate_ngram_range()
+
+        analyzer = self.build_analyzer()
+        X = self.bloom_bag.transform(analyzer(doc) for doc in X)
+        if self.binary:
+            X.data.fill(1)
+        if self.norm is not None:
+            X = normalize(X, norm=self.norm, copy=False)
+        return X
+
+    def fit_transform(self, X, y=None):
+        """Transform a sequence of documents to a document-term matrix.
+
+        Parameters
+        ----------
+        X : iterable over raw text documents, length = n_samples
+            Samples. Each sample must be a text document (either bytes or
+            unicode strings, file name or file object depending on the
+            constructor argument) which will be tokenized and hashed.
+        y : any
+            Ignored. This parameter exists only for compatibility with
+            sklearn.pipeline.Pipeline.
+
+        Returns
+        -------
+        X : sparse matrix of shape (n_samples, n_features)
+            Document-term matrix.
+        """
+        return self.fit(X, y).transform(X)
+
+    def _more_tags(self):
+        return {"X_types": ["string"]}
 
 
 class HashingVectorizer(

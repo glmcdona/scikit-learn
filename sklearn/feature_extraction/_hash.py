@@ -270,6 +270,16 @@ class BloomBags(TransformerMixin, BaseEstimator):
 
         return self
 
+    def get_size_in_bytes(self):
+        """
+        Returns the size in bytes of this set of BloomBags
+        """
+        size = 0
+        for bloom in self.bloom_filters:
+            size += len(bloom.get_bytes())
+
+        return size
+
     def transform(self, X):
         """Transform a sequence of instances to a scipy.sparse matrix.
         Parameters
