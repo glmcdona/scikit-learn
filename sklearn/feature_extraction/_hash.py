@@ -248,21 +248,24 @@ class BloomBags(TransformerMixin, BaseEstimator):
 
         # Now build the bloom filter vocabularies
         self.bloom_filters = []
-        bucket_size = int(len(self.feature_rank) / self.n_bags)
+        bucket_size = len(self.feature_rank) / self.n_bags
+        bucket_size_max = int(np.ceil(bucket_size))
 
         for i in range(self.n_bags):
             # Build the list of bloom filters, matching to each set of features
             # in the bucket
             if i == self.n_bags - 1:
                 # Last bucket may have more features
-                f = self.feature_rank[i * bucket_size :]
+                f = self.feature_rank[int(i * bucket_size) :]
             else:
-                f = self.feature_rank[i * bucket_size : (i + 1) * bucket_size]
+                f = self.feature_rank[int(i * bucket_size) : int((i + 1) * bucket_size)]
 
             # Create and fit the bloom filter
-            bloom = BloomFilter(len(f), self.error_rate)
-            for feature_name in f:
-                bloom.add(feature_name)
+            bloom = BloomFilter(bucket_size_max, self.error_rate)
+            # bloom.add_str_batch(f)
+            for feature in f:
+                bloom.add(feature)
+
             self.bloom_filters.append(bloom)
 
         return self
@@ -298,9 +301,13 @@ class BloomBags(TransformerMixin, BaseEstimator):
 
             # Iterate values in row
             for v, c in x:
+                feature_hash_indices = None
+
                 # Iterate over the bloom filters
                 for i, bloom in enumerate(self.bloom_filters):
-                    if v in bloom:
+                    if feature_hash_indices is None:
+                        feature_hash_indices = bloom.get_hash_indices(v)
+                    if bloom.contains_hash_indices(feature_hash_indices):
                         # Add count
                         X_by_bloombag[row][i] += 1
 
@@ -448,8 +455,9 @@ class BloomFilterFeatureHashers(TransformerMixin, BaseEstimator):
 
             # Create and fit the bloom filter
             bloom = BloomFilter(len(f), self.bloom_filter_error_rate)
-            for feature_name in f:
-                bloom.add(feature_name)
+            # bloom.add_str_batch(f)
+            for feature in f:
+                bloom.add_str(feature)
             self.bloom_filters.append(bloom)
 
             # Create and fit the hash bag
